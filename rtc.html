@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>视频通话 · 邻里智护</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin:0; background:#0d1117; color:#e6edf3; font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; height:100vh; overflow:hidden; }
+  #remote { position:fixed; inset:0; background:#000; }
+  #local { position:fixed; right:12px; top:12px; width:104px; height:150px; border-radius:12px; overflow:hidden; background:#161b22; border:1px solid #30363d; z-index:5; }
+  #hideLocal { position:fixed; right:16px; top:168px; z-index:6; font-size:12px; color:#8b949e; background:rgba(0,0,0,.45); border:1px solid #30363d; border-radius:8px; padding:3px 8px; }
+  #bar { position:fixed; left:0; right:0; bottom:0; padding:16px 16px calc(16px + env(safe-area-inset-bottom)); display:flex; gap:10px; justify-content:center; background:linear-gradient(transparent,rgba(0,0,0,.75)); z-index:6; }
+  .btn { border:0; border-radius:999px; padding:12px 20px; font-size:15px; font-weight:600; color:#fff; background:#21262d; }
+  .btn.pri { background:#2ea043; }
+  .btn.dan { background:#da3633; }
+  #cfg { position:fixed; inset:0; background:#0d1117; z-index:20; overflow:auto; padding:20px; }
+  #cfg h1 { font-size:17px; margin:6px 0 4px; }
+  #cfg p { font-size:12px; color:#8b949e; line-height:1.7; margin:6px 0 14px; }
+  #cfg label { display:block; font-size:12px; color:#8b949e; margin:12px 0 5px; }
+  #cfg input, #cfg select { width:100%; padding:11px 12px; border-radius:9px; border:1px solid #30363d; background:#161b22; color:#e6edf3; font-size:14px; }
+  #cfg .row { display:flex; gap:10px; margin-top:18px; }
+  #cfg .row .btn { flex:1; }
+  #log { position:fixed; left:12px; right:12px; bottom:86px; font-size:12px; color:#8b949e; text-align:center; z-index:6; line-height:1.6; }
+  .warn { position:fixed; left:12px; right:12px; top:12px; z-index:30; background:#9e6a03; color:#fff; font-size:12px; padding:10px 12px; border-radius:9px; line-height:1.6; display:none; }
+</style>
+</head>
+<body>
+<div class="warn" id="warn"></div>
+<div id="remote"></div>
+<div id="local"></div>
+<div id="hideLocal" style="display:none" onclick="toggleLocal()">隐藏本机画面</div>
+<div id="log">准备中…</div>
+<div id="bar">
+  <button class="btn" id="btnVoice" onclick="switchVoice()">仅语音</button>
+  <button class="btn dan" id="btnHang" onclick="hangup()">挂断</button>
+</div>
+
+<div id="cfg">
+  <h1>视频通话</h1>
+  <p>填写声网 AppID 即可，测试模式无需 Token。<br>
+     首次填完会记住。页面必须是 https 或 localhost，否则摄像头会被浏览器拦住。</p>
+  <label>AppID</label>
+  <input id="appid" placeholder="声网控制台 → 项目 → AppID（32 位字符串）">
+  <label>频道名（双方填同一个）</label>
+  <input id="channel" placeholder="例如 llzh-10086">
+  <label>我的 UID（双方不同即可）</label>
+  <input id="uid" placeholder="例如 elder1 / family1">
+  <label>Token（测试模式留空）</label>
+  <input id="token" placeholder="启用证书鉴权后才需要填写">
+  <label>通话模式</label>
+  <select id="mode"><option value="video">视频通话</option><option value="audio">语音通话</option></select>
+  <div class="row">
+    <button class="btn" onclick="preview()">先看本机画面</button>
+    <button class="btn pri" onclick="join()">进入通话</button>
+  </div>
+</div>
+
+<script src="https://download.agora.io/sdk/release/AgoraRTC_N-4.24.0.js"></script>
+<script>
+let client = null, micTrack = null, camTrack = null, joined = false, audioOnly = false;
+const $ = id => document.getElementById(id);
+function say(t) { $('log').textContent = t; }
+
+if (!window.isSecureContext) {
+  const w = $('warn');
+  w.style.display = 'block';
+  w.innerHTML = '⚠️ 当前地址不是安全上下文（需 https 或 localhost），摄像头会被拒绝。请用 https 地址打开本页。';
+}
+if (window.AgoraRTC) AgoraRTC.setLogLevel(3);
+
+const q = new URLSearchParams(location.search);
+const saved = JSON.parse(localStorage.getItem('llzh_rtc_cfg') || '{}');
+$('appid').value = q.get('appid') || saved.appid || '';
+$('channel').value = q.get('channel') || saved.channel || '';
+$('uid').value = q.get('uid') || saved.uid || '';
+$('token').value = q.get('token') || saved.token || '';
+$('mode').value = q.get('mode') || saved.mode || 'video';
+
+function cfg() {
+  const c = { appid: $('appid').value.trim(), channel: $('channel').value.trim(), uid: $('uid').value.trim(), token: $('token').value.trim(), mode: $('mode').value };
+  if (!c.appid || !c.channel || !c.uid) { alert('AppID、频道名、UID 三项必填'); return null; }
+  localStorage.setItem('llzh_rtc_cfg', JSON.stringify(c));
+  return c;
+}
+
+async function preview() {
+  const c = cfg(); if (!c) return;
+  $('cfg').style.display = 'none';
+  $('hideLocal').style.display = 'block';
+  try {
+    camTrack = await AgoraRTC.createCameraVideoTrack();
+    camTrack.play('local');
+    micTrack = await AgoraRTC.createMicrophoneAudioTrack();
+    say('摄像头和麦克风权限已通过，可以进入通话');
+  } catch (e) {
+    say('取权限失败：' + (e.name || '') + ' ' + (e.message || e));
+    alert('无法打开摄像头/麦克风：' + (e.message || e) + '\n\n常见原因：地址不是 https、权限被拒、或被其他应用占用。');
+  }
+}
+
+function toggleLocal() {
+  const l = $('local'), b = $('hideLocal');
+  if (l.style.display === 'none') { l.style.display = 'block'; b.textContent = '隐藏本机画面'; }
+  else { l.style.display = 'none'; b.textContent = '显示本机画面'; }
+}
+
+async function join() {
+  const c = cfg(); if (!c) return;
+  $('cfg').style.display = 'none';
+  $('hideLocal').style.display = 'block';
+  audioOnly = c.mode === 'audio';
+  say('正在进入频道 ' + c.channel + ' …');
+  try {
+    client = AgoraRTC.createClient({ mode: 'rtc', codec: 'vp8' });
+    client.on('user-published', async (user, mediaType) => {
+      await client.subscribe(user, mediaType);
+      if (mediaType === 'video') { $('remote').innerHTML = ''; user.videoTrack.play('remote'); }
+      if (mediaType === 'audio') user.audioTrack.play();
+      say('通话中');
+    });
+    client.on('user-unpublished', (user, mediaType) => {
+      if (mediaType === 'video') $('remote').innerHTML = '';
+    });
+    client.on('user-left', () => { $('remote').innerHTML = ''; say('对方已离开'); });
+    client.on('connection-state-changed', s => { if (s === 'DISCONNECTED') say('连接已断开'); });
+
+    await client.join(c.appid, c.channel, c.token || null, c.uid);
+    if (!micTrack) micTrack = await AgoraRTC.createMicrophoneAudioTrack();
+    if (!audioOnly && !camTrack) { camTrack = await AgoraRTC.createCameraVideoTrack(); camTrack.play('local'); }
+    await client.publish(audioOnly ? [micTrack] : [micTrack, camTrack]);
+    if (audioOnly) $('local').style.display = 'none';
+    joined = true;
+    $('btnVoice').textContent = audioOnly ? '开视频' : '仅语音';
+    say(audioOnly ? '语音通话中，等待对方…' : '已进入频道，等待对方…');
+  } catch (e) {
+    say('进房失败：' + (e.message || e));
+    alert('进入通话失败：' + (e.message || e) + '\n\n常见原因：AppID 不对、频道名非法、项目开启了鉴权但没填 Token。');
+    $('cfg').style.display = 'block';
+  }
+}
+
+async function switchVoice() {
+  if (!client || !joined) return;
+  try {
+    if (!audioOnly) {
+      if (camTrack) { await client.unpublish(camTrack); camTrack.stop(); camTrack.close(); camTrack = null; }
+      $('local').style.display = 'none';
+      audioOnly = true; $('btnVoice').textContent = '开视频'; say('已切换为仅语音');
+    } else {
+      camTrack = await AgoraRTC.createCameraVideoTrack();
+      camTrack.play('local');
+      await client.publish(camTrack);
+      $('local').style.display = 'block';
+      audioOnly = false; $('btnVoice').textContent = '仅语音'; say('已开启视频');
+    }
+  } catch (e) { say('切换失败：' + (e.message || e)); }
+}
+
+async function hangup() {
+  try {
+    if (client) { await client.unpublish(); await client.leave(); }
+  } catch (e) {}
+  [camTrack, micTrack].forEach(t => { try { t && t.stop(); t && t.close(); } catch (e) {} });
+  camTrack = micTrack = null; joined = false;
+  $('remote').innerHTML = '';
+  say('通话已结束');
+  setTimeout(() => { if (window.history.length > 1) history.back(); }, 600);
+}
+
+if (q.get('appid') && q.get('channel') && q.get('uid') && q.get('auto') === '1') setTimeout(join, 300);
+window.addEventListener('beforeunload', () => { try { client && client.leave(); } catch (e) {} });
+</script>
+</body>
+</html>
